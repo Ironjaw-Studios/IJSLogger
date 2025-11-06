@@ -11,6 +11,192 @@ using UnityEditor.Build;
 
 namespace com.ijs.logger
 {
+    /// <summary>
+    /// Defines different logging channels/categories for filtering logs.
+    /// </summary>
+    public enum LogChannel
+    {
+        Default,      // Always enabled if USE_LOGS is defined
+        Audio,
+        Network,
+        Physics,
+        AI,
+        UI,
+        Gameplay,
+        Performance,
+        Animation,
+        Input,
+        Rendering,
+        System
+    }
+
+    /// <summary>
+    /// Defines where a channel should be active.
+    /// </summary>
+    public enum ChannelScope
+    {
+        EditorOnly,   // Only log in Unity Editor
+        BuildOnly,    // Only log in builds (not editor)
+        Both          // Log in both editor and builds
+    }
+
+    /// <summary>
+    /// Handles rate limiting for log messages to prevent spam.
+    /// </summary>
+    public static class LogRateLimiter
+    {
+        private class LogEntry
+        {
+            public float LastLogTime;
+            public int SuppressedCount;
+        }
+
+        private static readonly Dictionary<string, LogEntry> LogCache = new Dictionary<string, LogEntry>();
+
+        /// <summary>
+        /// Checks if a log should be displayed based on rate limiting.
+        /// </summary>
+        /// <param name="key">Unique key for this log message</param>
+        /// <param name="rateLimitSeconds">Minimum seconds between logs</param>
+        /// <returns>True if the log should be displayed, false if suppressed</returns>
+        public static bool ShouldLog(string key, float rateLimitSeconds)
+        {
+            if (!LogCache.TryGetValue(key, out var entry))
+            {
+                LogCache[key] = new LogEntry { LastLogTime = Time.unscaledTime, SuppressedCount = 0 };
+                return true;
+            }
+
+            if (Time.unscaledTime - entry.LastLogTime >= rateLimitSeconds)
+            {
+                entry.LastLogTime = Time.unscaledTime;
+                entry.SuppressedCount = 0;
+                return true;
+            }
+
+            entry.SuppressedCount++;
+            return false;
+        }
+
+        /// <summary>
+        /// Gets the number of suppressed logs for a given key.
+        /// </summary>
+        public static int GetSuppressedCount(string key)
+        {
+            return LogCache.TryGetValue(key, out var entry) ? entry.SuppressedCount : 0;
+        }
+
+        /// <summary>
+        /// Clears all rate limiting data.
+        /// </summary>
+        public static void Clear()
+        {
+            LogCache.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Provides scoped context for log messages using the disposable pattern.
+    /// </summary>
+    public class LogContext : IDisposable
+    {
+        private static readonly Stack<string> ContextStack = new Stack<string>();
+
+        /// <summary>
+        /// Gets the current context string formatted for log messages.
+        /// </summary>
+        public static string CurrentContext
+        {
+            get
+            {
+                if (ContextStack.Count == 0) return "";
+                var contexts = new List<string>(ContextStack);
+                contexts.Reverse();
+                return $"[{string.Join(" > ", contexts)}] ";
+            }
+        }
+
+        /// <summary>
+        /// Creates a new log context scope.
+        /// </summary>
+        /// <param name="context">The context name</param>
+        public LogContext(string context)
+        {
+            ContextStack.Push(context);
+        }
+
+        /// <summary>
+        /// Removes this context from the stack when disposed.
+        /// </summary>
+        public void Dispose()
+        {
+            if (ContextStack.Count > 0)
+                ContextStack.Pop();
+        }
+
+        /// <summary>
+        /// Clears all contexts.
+        /// </summary>
+        public static void Clear()
+        {
+            ContextStack.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Provides fluent assertion API with automatic logging and actions.
+    /// </summary>
+    public class LogAssert
+    {
+        private readonly IJSLogger _logger;
+        private readonly bool _condition;
+        private readonly string _message;
+
+        internal LogAssert(IJSLogger logger, bool condition, string message)
+        {
+            _logger = logger;
+            _condition = condition;
+            _message = message;
+
+            if (!condition)
+            {
+                _logger.PrintLog($"ASSERTION FAILED: {message}", LogType.Error);
+            }
+        }
+
+        /// <summary>
+        /// Executes a callback if the assertion fails.
+        /// </summary>
+        public LogAssert OnFailure(Action callback)
+        {
+            if (!_condition)
+                callback?.Invoke();
+            return this;
+        }
+
+        /// <summary>
+        /// Breaks into the debugger if attached and assertion fails.
+        /// </summary>
+        public LogAssert BreakDebugger()
+        {
+            if (!_condition && System.Diagnostics.Debugger.IsAttached)
+                System.Diagnostics.Debugger.Break();
+            return this;
+        }
+
+#if UNITY_EDITOR
+        /// <summary>
+        /// Pauses the Unity Editor if the assertion fails.
+        /// </summary>
+        public LogAssert PauseEditor()
+        {
+            if (!_condition)
+                UnityEditor.EditorApplication.isPaused = true;
+            return this;
+        }
+#endif
+    }
+
     public class IJSLogger
     {
         #if UNITY_EDITOR
@@ -77,12 +263,14 @@ namespace com.ijs.logger
         private Color _logColor; // Color for log messages
         private bool _logsEnabled; // Whether or not to log
         private string _logPrefix; // Prefix for log messages
+        private LogChannel _channel; // Channel for filtering logs
 
-        public IJSLogger(string prefix = "", Color? color = null, bool logsEnabled = true)
+        public IJSLogger(string prefix = "", Color? color = null, bool logsEnabled = true, LogChannel channel = LogChannel.Default)
         {
             _logColor = color ?? Color.white;
             _logPrefix = prefix;
             _logsEnabled = logsEnabled;
+            _channel = channel;
         }
 
         public void ToggleLogs(bool enable)
@@ -100,11 +288,82 @@ namespace com.ijs.logger
             _logColor = color;
         }
 
+        /// <summary>
+        /// Asserts a condition and logs an error if it fails.
+        /// </summary>
+        public LogAssert Assert(bool condition, string message)
+        {
+            return new LogAssert(this, condition, message);
+        }
+
+        /// <summary>
+        /// Validates that an object is not null.
+        /// </summary>
+        public void ValidateNotNull(object obj, string paramName)
+        {
+            Assert(obj != null, $"{paramName} cannot be null");
+        }
+
+        /// <summary>
+        /// Validates that a value is within a specified range.
+        /// </summary>
+        public void ValidateRange(float value, float min, float max, string paramName)
+        {
+            Assert(value >= min && value <= max, $"{paramName} must be between {min} and {max}, but was {value}");
+        }
+
+        /// <summary>
+        /// Logs a message only if the condition is true.
+        /// </summary>
+        [Conditional("USE_LOGS")]
+        public void LogIf(bool condition, string message, LogType logType = LogType.Log, GameObject go = null)
+        {
+            if (condition)
+                PrintLog(message, logType, go);
+        }
+
+        /// <summary>
+        /// Logs a message only if the condition function returns true. Uses lazy evaluation.
+        /// </summary>
+        [Conditional("USE_LOGS")]
+        public void LogIf(Func<bool> condition, Func<string> messageBuilder, LogType logType = LogType.Log, GameObject go = null)
+        {
+            if (condition())
+                PrintLog(messageBuilder(), logType, go);
+        }
+
+        /// <summary>
+        /// Logs a message with rate limiting to prevent spam.
+        /// </summary>
+        [Conditional("USE_LOGS")]
+        public void LogThrottled(string message, float minIntervalSeconds, LogType logType = LogType.Log, GameObject go = null)
+        {
+            var key = $"{GetHashCode()}_{message}";
+            if (LogRateLimiter.ShouldLog(key, minIntervalSeconds))
+            {
+                var suppressedCount = LogRateLimiter.GetSuppressedCount(key);
+                var finalMessage = suppressedCount > 0
+                    ? $"{message} (suppressed {suppressedCount}x)"
+                    : message;
+                PrintLog(finalMessage, logType, go);
+            }
+        }
+
         [Conditional("USE_LOGS")]
         public void PrintLog(string message, LogType logType = LogType.Log, GameObject go = null)
         {
             if (!_logsEnabled) return;
-            message = $"{_logPrefix}:: {message}";
+
+            // Check if channel is enabled
+            if (!IJSLoggerSettings.IsChannelEnabled(_channel)) return;
+
+            // Add context if any
+            message = LogContext.CurrentContext + message;
+
+            // Add prefix
+            if (!string.IsNullOrEmpty(_logPrefix))
+                message = $"{_logPrefix}:: {message}";
+
             Log(message, logType, go, _logColor);
         }
 
